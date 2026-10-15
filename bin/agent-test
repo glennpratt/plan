@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# agent-test: run one Copilot CLI scenario against a sandboxed copy of the
+# planning workspace, without Jira credentials, and record what it did.
+#
+#   plan-agent-test NAME "PROMPT" [extra copilot options...]
+#
+# Model: $AGENT_TEST_MODEL (default gpt-6-luna). Output: $AGENT_TEST_DIR
+# (default $TMPDIR/planning-agent-test)/results/NAME.*:
+#   NAME.log      the run's terminal output
+#   NAME.md       the shared session (every tool call and result)
+#   NAME.changes  beads the run changed in the copy (before/after export)
+#
+# Isolation (macOS):
+# - The workspace (`plan where`) is cloned fresh (APFS clone, database
+#   included) without .envrc/.envrc.local/.direnv: no token, no direnv.
+#   PLAN_DATA points plan at the copy.
+# - The environment is rebuilt from scratch. PATH holds plan, bd and python3
+#   (each a copy, or a link into the Nix store whose closure is granted
+#   read-only), node/npx for Copilot itself, and /usr/bin:/bin. No op.
+# - Copilot gets its own COPILOT_HOME whose sandbox policy confines every
+#   shell command with Seatbelt: no bypass, no network, no keychain; the real
+#   workspace, the Jira credential directories (`plan where --json`), ~/.ssh,
+#   1Password and the real Copilot/Claude homes are denied.
+set -euo pipefail
+
+if [ $# -lt 2 ]; then
+	sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+	exit 2
+fi
+name="$1" prompt="$2"
+shift 2
+
+here="$(cd "$(dirname "$0")" && pwd)"
+plan_bin="$here/plan"
+where="$("$plan_bin" where --json)"
+planning="$(jq -r .data <<<"$where")"
+root="${AGENT_TEST_DIR:-${TMPDIR:-/tmp}/planning-agent-test}"
+model="${AGENT_TEST_MODEL:-gpt-6-luna}"
+work="$root/workspace" home="$root/copilot-home" tools="$root/tools" results="$root/results"
+
+# Fresh copy of the workspace, and no results left from an earlier run.
+rm -rf "$work" "$tools"
+mkdir -p "$root" "$home" "$tools" "$results"
+rm -f "$results/$name".*
+/bin/cp -cR "$planning" "$work" # macOS cp: APFS clone, instant
+rm -rf "$work/.envrc" "$work/.envrc.local" "$work/.direnv"
+
+# Tools on PATH. A tool from the Nix store is linked and its closure granted
+# read-only; anything else is copied (bd also gets its Nix-store libraries).
+# Other store paths, op's included, stay unreadable.
+grants=()
+add_tool() { # name path
+	local real
+	real="$(readlink -f "$2")"
+	case "$real" in
+	/nix/store/*)
+		ln -s "$real" "$tools/$1"
+		mapfile -t -O "${#grants[@]}" grants < <(nix-store -qR "$real")
+		;;
+	*)
+		cp "$real" "$tools/$1"
+		mapfile -t -O "${#grants[@]}" grants < <(otool -L "$real" 2>/dev/null | sed -nE 's#^[[:space:]]*(/nix/store/[^/]+)/.*#\1#p')
+		;;
+	esac
+}
+add_tool plan "$plan_bin"
+add_tool bd "$(command -v bd)"
+add_tool python3 "$(command -v python3)"
+ln -s "$(command -v node)" "$tools/node"
+ln -s "$(command -v npx)" "$tools/npx"
+
+op_store="$(readlink -f "$(command -v op 2>/dev/null || echo /nonexistent)" | sed -nE 's#^(/nix/store/[^/]+)/.*#\1#p')"
+
+cp "$HOME/.copilot/config.json" "$home/config.json" # login lives in the keychain
+jq -n \
+	--argjson ro "$(printf '%s\n' "${grants[@]}" | sort -u | jq -R . | jq -s .)" \
+	--argjson creds "$(jq .credential_dirs <<<"$where")" \
+	--arg planning "$planning" \
+	--arg home "$HOME" \
+	--arg work "$(cd "$work" && pwd -P)" \
+	--arg op "$op_store" \
+	'{sandbox: {
+		enabled: true,
+		addCurrentWorkingDirectory: true,
+		allowDevToolAccess: false,
+		allowBypass: false,
+		auth: {git: false, gh: false},
+		sandboxMcpServers: true,
+		sandboxLspServers: true,
+		userPolicy: {
+			filesystem: {
+				readwritePaths: [$work],
+				# bd and dolt read their user config.
+				readonlyPaths: ($ro + ["\($home)/.dolt", "\($home)/.config/bd"]),
+				deniedPaths: ([
+					$planning,
+					"\($home)/.ssh", "\($home)/.config/op",
+					"\($home)/Library/Group Containers/2BUA8C4S2C.com.1password",
+					"\($home)/.copilot", "\($home)/.claude"
+				] + $creds + (if $op == "" then [] else [$op] end))
+			},
+			network: {allowOutbound: false, allowLocalNetwork: false},
+			seatbelt: {keychainAccess: false}
+		}
+	}}' >"$home/settings.json"
+
+run_env=(env -i
+	HOME="$HOME" USER="$USER" TERM="${TERM:-xterm-256color}" LANG="${LANG:-en_US.UTF-8}"
+	TMPDIR="${TMPDIR:-/tmp}"
+	PATH="$tools:/usr/bin:/bin"
+	PLAN_DATA="$work"
+	BEADS_ACTOR="${BEADS_ACTOR:-$USER}"
+	COPILOT_HOME="$home")
+
+snapshot() { (cd "$work" && "${run_env[@]}" bd export -o "$1" >/dev/null); }
+snapshot "$results/$name.before.jsonl"
+
+echo "agent-test $name: model $model, workspace $work"
+status=0
+"${run_env[@]}" npx -y @github/copilot \
+	--experimental \
+	-C "$work" \
+	--model "$model" \
+	--allow-all-tools \
+	--no-ask-user \
+	--no-auto-update \
+	--share "$results/$name.md" \
+	-p "$prompt" \
+	"$@" 2>&1 | tee "$results/$name.log" || status=$?
+
+snapshot "$results/$name.after.jsonl"
+{ diff <(sort "$results/$name.before.jsonl") <(sort "$results/$name.after.jsonl") || true; } |
+	sed -n 's/^> //p' |
+	jq -r '"\(.id)\t\(.external_ref // "-" | sub(".*/browse/"; ""))\t\(.status)\t\(.title)"' \
+		>"$results/$name.changes"
+echo "Changed beads:"
+cat "$results/$name.changes"
+echo "Results: $results/$name.{log,md,changes}"
+if [ "$status" -ne 0 ]; then
+	echo "copilot exited $status" | tee -a "$results/$name.log"
+fi
+exit "$status"

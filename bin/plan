@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+"""plan: views and safe Jira sync for a personal beads planning workspace.
+
+Read-only views work from any directory and need no Jira credentials:
+
+  plan mine [--all]            my work-board items, by column then board rank
+  plan next [-n N] [WORDS...]  candidates to pick up next (To Do, then backlog)
+  plan oncall [--recent DAYS]  on-call board in rank order (+ recently moved off)
+  plan tree KEY|ID             an epic/issue subtree with assignees and readiness
+  plan blocked [--mine]        open work waiting on open blockers (cross-team first)
+  plan find WORDS...           search titles and descriptions
+  plan show KEY|ID             one bead (bd show)
+  plan where                   the planning workspace directory
+
+Jira (token from $JIRA_API_TOKEN, else the 1Password reference in plan.toml):
+
+  plan ticket KEY              full Jira issue with comments (read-only)
+  plan pull [--full] [KEY...]  pull scopes and boards, or just the given issues
+  plan push KEY|ID... [--yes]  preview a push of the named issues; with --yes,
+                               push them. Never pushes without explicit IDs.
+
+Add --json to a view for machine-readable output.
+
+Configuration: ~/.config/plan/config.toml names the workspace (data =
+"~/path/to/planning"); $PLAN_DATA overrides it. The workspace's plan.toml
+holds the Jira settings; the per-device config.toml may override any of them.
+"""
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+import ssl
+import tomllib
+from datetime import datetime, timezone
+
+# Board columns in working order: active work first, then waiting, then new.
+COLUMN_ORDER = ["In Progress", "Code Review", "Testing", "Blocked", "To Do", "Escalated", "Triage", "Backlog", "Done"]
+
+
+def die(msg):
+    print(f"plan: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _load_config():
+    """The workspace (config.toml's data, or $PLAN_DATA) and its settings:
+    the workspace's plan.toml, overridden per device by config.toml."""
+    home = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    path = os.path.join(home, "plan", "config.toml")
+    user = {}
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            user = tomllib.load(f)
+    data = os.environ.get("PLAN_DATA") or user.get("data")
+    if not data:
+        die(f'no planning workspace: set data = "~/path/to/planning" in {path}')
+    data = os.path.expanduser(data)
+    cfg = {}
+    ws = os.path.join(data, "plan.toml")
+    if os.path.exists(ws):
+        with open(ws, "rb") as f:
+            cfg = tomllib.load(f)
+    for k, v in user.items():
+        cfg[k] = {**cfg.get(k, {}), **v} if isinstance(v, dict) and isinstance(cfg.get(k), dict) else v
+    cfg["data"] = data
+    return cfg
+
+
+CFG = _load_config()
+PLANNING = CFG["data"]
+ME = os.environ.get("BEADS_ACTOR") or CFG.get("me") or os.environ.get("USER", "")
+VIEWS = CFG.get("views", {})
+WORK_BOARD = VIEWS.get("work_board", "work")
+ONCALL_BOARD = VIEWS.get("oncall_board", "oncall")
+ONCALL_PROJECT = VIEWS.get("oncall_project", "")
+JIRA = CFG.get("jira", {})
+JIRA_BROWSE = JIRA.get("browse", "")
+
+
+def jira_setting(name):
+    v = JIRA.get(name)
+    if not v:
+        die(f"jira.{name} is not set in {os.path.join(PLANNING, 'plan.toml')}")
+    return v
+
+
+def bd(*args, env=None, check=True, capture=True):
+    # bd from PATH (the plan package puts its own last, so a dev build on
+    # PATH wins). There is deliberately no plan-specific override.
+    cmd = [shutil.which("bd") or die("bd not found on PATH"), "-C", PLANNING, *args]
+    full_env = {**os.environ, "BD_NON_INTERACTIVE": "1", "BEADS_ACTOR": ME, **(env or {})}
+    r = subprocess.run(cmd, env=full_env, text=True, capture_output=capture)
+    if check and r.returncode != 0:
+        die(f"{' '.join(args)} failed:\n{r.stderr or r.stdout}")
+    return r
+
+
+def load():
+    """All beads, with derived fields, from one export."""
+    with tempfile.NamedTemporaryFile(suffix=".jsonl") as f:
+        bd("export", "-o", f.name)
+        beads = [json.loads(l) for l in open(f.name) if l.strip()]
+    by_id = {b["id"]: b for b in beads}
+    for b in beads:
+        ref = b.get("external_ref") or ""
+        b["key"] = ref.rsplit("/", 1)[-1] if "/browse/" in ref else ""
+        b["meta"] = b.get("metadata") if isinstance(b.get("metadata"), dict) else {}
+        b["children"] = []
+    for b in beads:
+        b["parents"] = []
+        b["blockers"] = []
+        for d in b.get("dependencies") or []:
+            other = by_id.get(d["depends_on_id"])
+            if not other:
+                continue
+            if d["type"] == "parent-child":
+                b["parents"].append(other["id"])
+                other["children"].append(b["id"])
+            elif d["type"] == "blocks":
+                b["blockers"].append(other["id"])
+    return beads, by_id
+
+
+def is_open(b):
+    return b.get("status") not in ("closed",)
+
+
+def open_blockers(b, by_id):
+    return [by_id[x] for x in b["blockers"] if is_open(by_id[x])]
+
+
+def on_board(b, board):
+    return f"board:{board}" in (b.get("labels") or [])
+
+
+def in_backlog(b, board):
+    return f"backlog:{board}" in (b.get("labels") or [])
+
+
+def board_entry(b, board):
+    return (b["meta"].get("jira_boards") or {}).get(board) or {}
+
+
+def column_rank(col):
+    return COLUMN_ORDER.index(col) if col in COLUMN_ORDER else len(COLUMN_ORDER)
+
+
+def jira_time(b, field):
+    """Jira's created/updated time (bead timestamps are local import times)."""
+    raw = b["meta"].get(f"jira_{field}") or b.get(f"{field}_at")
+    if not raw:
+        return None
+    raw = raw.replace("Z", "+00:00")
+    raw = re.sub(r"\.\d+", "", raw)                      # drop milliseconds
+    raw = re.sub(r"([+-]\d\d)(\d\d)$", r"\1:\2", raw)  # +0000 -> +00:00
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
+def age_days(b):
+    t = jira_time(b, "created")
+    return (datetime.now(timezone.utc) - t).days if t else None
+
+
+NOT_WORK_ITEMS = {"epic", "milestone", "capability", "initiative", "program"}
+
+
+def resolve(by_id, beads, ref):
+    if ref in by_id:
+        return by_id[ref]
+    for b in beads:
+        if b["key"].upper() == ref.upper():
+            return b
+    die(f"no bead for {ref}")
+
+
+def row(b, board=None, extra=""):
+    """One-line summary: key, bead id, Jira status/column, priority, assignee, title."""
+    status = b["meta"].get("jira_status") or b.get("status")
+    col = board_entry(b, board).get("column") if board else b["meta"].get("jira_column")
+    pri = b["meta"].get("jira_priority") or f"P{b.get('priority')}"
+    who = b.get("assignee") or "-"
+    where = f"{col} / {status}" if col and col != status else status
+    key = b["key"] or "(local)"
+    return f"{key:<12} {b['id']:<10} {where:<24.24} {pri:<12.12} {who:<10.10} {b.get('title','')}{extra}"
+
+
+def as_json(items, board=None):
+    return [{
+        "key": b["key"], "id": b["id"], "url": JIRA_BROWSE + b["key"] if b["key"] else None,
+        "title": b.get("title"), "status": b.get("status"), "jira_status": b["meta"].get("jira_status"),
+        "column": (board_entry(b, board).get("column") if board else b["meta"].get("jira_column")),
+        "rank": (board_entry(b, board).get("rank") if board else b["meta"].get("jira_rank")),
+        "priority": b.get("priority"), "jira_priority": b["meta"].get("jira_priority"),
+        "assignee": b.get("assignee"), "type": b["meta"].get("jira_type") or b.get("issue_type"),
+        "labels": b.get("labels"), "open_blockers": [x for x in b["blockers"]],
+        "description": (b.get("description") or "")[:2000],
+    } for b in items]
+
+
+def emit(args, items, board=None, header=None, extra=lambda b: ""):
+    if args.json:
+        print(json.dumps(as_json(items, board), indent=1))
+        return
+    if header:
+        print(header)
+    for b in items:
+        print(row(b, board, extra(b)))
+    if not items:
+        print("  (none)")
+
+
+# ---------------------------------------------------------------- views
+
+def cmd_mine(args):
+    beads, by_id = load()
+    items = [b for b in beads if b.get("assignee") == ME and on_board(b, WORK_BOARD)
+             and (args.all or is_open(b))]
+    items.sort(key=lambda b: (column_rank(board_entry(b, WORK_BOARD).get("column")), board_entry(b, WORK_BOARD).get("rank") or ""))
+    emit(args, items, WORK_BOARD, f"Work board, assigned to {ME} ({len(items)}):",
+         lambda b: f"  [blocked by {', '.join(x['key'] or x['id'] for x in open_blockers(b, by_id))}]" if open_blockers(b, by_id) else "")
+
+
+def cmd_next(args):
+    beads, by_id = load()
+    words = [w.lower() for w in args.words]
+
+    def matches(b):
+        text = (b.get("title", "") + " " + (b.get("description") or "")).lower()
+        return all(w in text for w in words)
+
+    def mine(b):
+        if args.anyone:
+            return True
+        if args.unassigned:
+            return not b.get("assignee")
+        return b.get("assignee") == ME
+
+    cands = [b for b in beads if b.get("status") == "open" and mine(b) and matches(b)
+             and not open_blockers(b, by_id)
+             and b.get("issue_type") not in NOT_WORK_ITEMS
+             and (b["meta"].get("jira_type") or "").lower() not in NOT_WORK_ITEMS
+             and (on_board(b, WORK_BOARD) or in_backlog(b, WORK_BOARD) or not b["key"])]
+
+    def group(b):
+        col = board_entry(b, WORK_BOARD).get("column")
+        if on_board(b, WORK_BOARD) and col == "To Do":
+            return 0
+        if on_board(b, WORK_BOARD):
+            return 1
+        if in_backlog(b, WORK_BOARD):
+            return 2
+        return 3  # local-only beads
+
+    cands.sort(key=lambda b: (group(b), b.get("priority", 2), board_entry(b, WORK_BOARD).get("rank") or "~"))
+    emit(args, cands[: args.n], WORK_BOARD,
+         f"Next candidates ({len(cands)} unblocked; showing {min(len(cands), args.n)}; To Do, then board, then backlog; priority, then rank):")
+
+
+def cmd_oncall(args):
+    beads, by_id = load()
+    board = [b for b in beads if on_board(b, ONCALL_BOARD) and is_open(b)]
+    board.sort(key=lambda b: board_entry(b, ONCALL_BOARD).get("rank") or "~")
+    extra = lambda b: f"  ({age_days(b)}d old)" if age_days(b) is not None else ""
+    if args.json:
+        print(json.dumps(as_json(board, ONCALL_BOARD), indent=1))
+        return
+    emit(args, board, ONCALL_BOARD, f"On-call board, rank order ({len(board)}):", extra)
+    if args.recent:
+        cutoff = datetime.now(timezone.utc).timestamp() - args.recent * 86400
+        def recent(b):
+            t = jira_time(b, "updated")
+            return bool(t) and t.timestamp() >= cutoff
+        if not ONCALL_PROJECT:
+            die("--recent needs views.oncall_project in plan.toml")
+        prefix = ONCALL_PROJECT + "-"
+        moved = [b for b in beads if b["key"].startswith(prefix) and not on_board(b, ONCALL_BOARD) and recent(b)]
+        moved.sort(key=lambda b: jira_time(b, "updated") or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+        emit(args, moved, None, f"\n{ONCALL_PROJECT} updated in the last {args.recent}d, off the board ({len(moved)}):")
+
+
+def cmd_tree(args):
+    beads, by_id = load()
+    root = resolve(by_id, beads, args.ref)
+    seen, lines, members = set(), [], []
+
+    def walk(b, depth):
+        if b["id"] in seen:
+            return
+        seen.add(b["id"])
+        members.append(b)
+        mark = "x" if not is_open(b) else ("!" if open_blockers(b, by_id) else " ")
+        lines.append(f"{'  ' * depth}[{mark}] {row(b)}")
+        for cid in sorted(b["children"], key=lambda c: (not is_open(by_id[c]), by_id[c]["meta"].get("jira_rank") or "~")):
+            if args.all or is_open(by_id[cid]):
+                walk(by_id[cid], depth + 1)
+
+    walk(root, 0)
+    if args.json:
+        print(json.dumps(as_json(members), indent=1))
+        return
+    print("[ ] open  [!] blocked  [x] closed")
+    print("\n".join(lines))
+    open_items = [b for b in members[1:] if is_open(b)]
+    counts = {}
+    for b in open_items:
+        counts[b.get("assignee") or "(unassigned)"] = counts.get(b.get("assignee") or "(unassigned)", 0) + 1
+    print(f"\nOpen under {root['key'] or root['id']}: {len(open_items)}  by assignee: " +
+          ", ".join(f"{k} {v}" for k, v in sorted(counts.items(), key=lambda x: -x[1])))
+    ready_unassigned = [b for b in open_items if not b.get("assignee") and not open_blockers(b, by_id)]
+    if ready_unassigned:
+        print(f"Ready and unassigned ({len(ready_unassigned)}): " + ", ".join(b["key"] or b["id"] for b in ready_unassigned))
+
+
+def cmd_blocked(args):
+    beads, by_id = load()
+    items = []
+    for b in beads:
+        if not is_open(b) or (args.mine and b.get("assignee") != ME):
+            continue
+        blockers = open_blockers(b, by_id)
+        if blockers:
+            items.append((b, blockers))
+    proj = lambda b: (b["key"].split("-")[0] if b["key"] else "")
+    items.sort(key=lambda x: (all(proj(o) == proj(x[0]) for o in x[1]), x[0]["key"]))
+    if args.json:
+        out = as_json([b for b, _ in items])
+        for o, (_, bl) in zip(out, items):
+            o["open_blockers"] = [{"key": x["key"], "id": x["id"], "status": x["meta"].get("jira_status") or x["status"], "assignee": x.get("assignee"), "title": x.get("title")} for x in bl]
+        print(json.dumps(out, indent=1))
+        return
+    print(f"Open work waiting on open blockers ({len(items)}; other-team blockers first):")
+    for b, bl in items:
+        print(row(b))
+        for x in bl:
+            print(f"    waits on {row(x)}")
+
+
+def cmd_find(args):
+    beads, _ = load()
+    words = [w.lower() for w in args.words]
+    hits = [b for b in beads if all(w in (b.get("title", "") + " " + (b.get("description") or "") + " " + b["key"]).lower() for w in words)
+            and (args.all or is_open(b))]
+    hits.sort(key=lambda b: (not is_open(b), b.get("priority", 2), b["key"]))
+    emit(args, hits, None, f"Matches ({len(hits)}):")
+
+
+def cmd_show(args):
+    beads, by_id = load()
+    b = resolve(by_id, beads, args.ref)
+    r = bd("show", b["id"])
+    print(r.stdout)
+    if b["key"] and JIRA_BROWSE:
+        print(JIRA_BROWSE + b["key"])
+
+
+def cmd_where(args):
+    if args.json:
+        # For sandboxes (plan-agent-test): what to copy and what to deny.
+        creds = sorted({os.path.dirname(os.path.expanduser(JIRA[k]))
+                        for k in ("client_cert", "client_key", "ca_cert") if JIRA.get(k)})
+        print(json.dumps({"data": PLANNING, "credential_dirs": creds}))
+        return
+    print(PLANNING)
+
+
+# ---------------------------------------------------------------- Jira
+
+def jira_env():
+    """Credentials for bd's Jira commands: the token ($JIRA_API_TOKEN, else
+    jira.token, a 1Password reference) and any mTLS certificate paths."""
+    token = os.environ.get("JIRA_API_TOKEN")
+    if not token:
+        # Agent sandboxes have no Jira credentials on purpose: hand the
+        # command to the user rather than inviting a hunt for the token.
+        handoff = ("no Jira access from here (no token). This is expected in agent sandboxes; "
+                   "do not look for credentials or change sandbox policy. "
+                   f"Ask the user to run: plan {' '.join(shlex.quote(a) for a in sys.argv[1:])}")
+        ref = JIRA.get("token")
+        if not ref:
+            die(handoff)
+        try:
+            r = subprocess.run(["op", "read", ref], text=True, capture_output=True)
+        except FileNotFoundError:
+            die(handoff)
+        if r.returncode != 0:
+            die(f"{handoff}\n(1Password: {r.stderr.strip()})")
+        token = r.stdout.strip()
+    env = {"JIRA_API_TOKEN": token}
+    for var, key in (("JIRA_CLIENT_CERT", "client_cert"), ("JIRA_CLIENT_KEY", "client_key"), ("JIRA_CA_CERT", "ca_cert")):
+        if JIRA.get(key):
+            env[var] = os.path.expanduser(JIRA[key])
+    return env
+
+
+def cmd_ticket(args):
+    env = jira_env()
+    ctx = ssl.create_default_context(cafile=env.get("JIRA_CA_CERT"))
+    if env.get("JIRA_CLIENT_CERT"):
+        ctx.load_cert_chain(env["JIRA_CLIENT_CERT"], env.get("JIRA_CLIENT_KEY"))
+    fields = "summary,status,assignee,reporter,priority,issuetype,created,updated,labels,description,comment,issuelinks,resolution"
+    req = urllib.request.Request(f"{jira_setting('api').rstrip('/')}/rest/api/2/issue/{args.key}?fields={fields}",
+                                 headers={"Authorization": f"Bearer {env['JIRA_API_TOKEN']}", "Accept": "application/json"})
+    with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
+        issue = json.load(resp)
+    if args.json:
+        print(json.dumps(issue, indent=1))
+        return
+    f = issue["fields"]
+    name = lambda u: (u or {}).get("displayName") or "-"
+    print(f"{issue['key']}  {f['summary']}")
+    if JIRA_BROWSE:
+        print(f"{JIRA_BROWSE}{issue['key']}")
+    print(f"Type: {f['issuetype']['name']}  Status: {f['status']['name']}  Resolution: {(f.get('resolution') or {}).get('name') or '-'}  "
+          f"Priority: {(f.get('priority') or {}).get('name') or '-'}")
+    print(f"Assignee: {name(f.get('assignee'))}  Reporter: {name(f.get('reporter'))}  Created: {f['created'][:10]}  Updated: {f['updated'][:10]}")
+    if f.get("labels"):
+        print("Labels: " + ", ".join(f["labels"]))
+    for l in f.get("issuelinks") or []:
+        other = l.get("outwardIssue") or l.get("inwardIssue")
+        rel = l["type"]["outward"] if l.get("outwardIssue") else l["type"]["inward"]
+        print(f"Link: {rel} {other['key']} ({other['fields']['status']['name']}) {other['fields']['summary']}")
+    print("\n--- Description ---\n" + (f.get("description") or "(none)"))
+    comments = (f.get("comment") or {}).get("comments") or []
+    print(f"\n--- Comments ({len(comments)}) ---")
+    for c in comments:
+        print(f"\n[{c['created'][:16].replace('T', ' ')}] {name(c.get('author'))}:\n{c['body']}")
+
+
+def cmd_pull(args):
+    """Pull scopes and boards, or with keys, just those issues (which are
+    then kept current by later pulls)."""
+    if args.keys:
+        cmd = ["jira", "pull", *args.keys]
+    else:
+        cmd = ["jira", "sync", "--pull"] + (["--full"] if args.full else [])
+    if args.dry_run:
+        cmd.append("--dry-run")
+    r = bd(*cmd, env=jira_env(), check=False, capture=False)
+    sys.exit(r.returncode)
+
+
+def cmd_push(args):
+    if not args.refs:
+        die("push needs explicit issue keys or bead IDs (a full push is never run from here)")
+    beads, by_id = load()
+    ids = [resolve(by_id, beads, ref)["id"] for ref in args.refs]
+    env = jira_env()
+    preview = bd("jira", "push", *ids, "--dry-run", env=env, check=False)
+    lines = [l for l in (preview.stdout + preview.stderr).splitlines() if "[dry-run]" in l or l.startswith("Warning")]
+    if args.yes:
+        # Same list, worded as what is being sent: "[dry-run] Would update" -> "Update".
+        lines = [re.sub(r"\[dry-run\] Would (\w)", lambda m: m.group(1).upper(), l) for l in lines]
+    print("Sending:" if args.yes else "Preview:")
+    print("\n".join(lines) if lines else "  (nothing to push)")
+    if not args.yes:
+        print("\nNothing sent. Re-run with --yes to push exactly this.")
+        return
+    if not lines:
+        return
+    r = bd("jira", "push", *ids, env=env, check=False)
+    print((r.stdout + r.stderr).strip())
+    sys.exit(r.returncode)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="plan", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add(name, fn, help):
+        sp = sub.add_parser(name, help=help)
+        sp.add_argument("--json", action="store_true", help="machine-readable output")
+        sp.set_defaults(fn=fn)
+        return sp
+
+    add("mine", cmd_mine, "my work-board items").add_argument("--all", action="store_true", help="include closed")
+    sp = add("next", cmd_next, "candidates to pick up next")
+    sp.add_argument("-n", type=int, default=15)
+    sp.add_argument("--unassigned", action="store_true", help="unassigned instead of mine")
+    sp.add_argument("--anyone", action="store_true", help="any assignee")
+    sp.add_argument("words", nargs="*", help="filter: all words must appear in title/description")
+    add("oncall", cmd_oncall, "on-call board").add_argument("--recent", type=int, default=0, metavar="DAYS")
+    sp = add("tree", cmd_tree, "subtree of an epic or issue")
+    sp.add_argument("ref")
+    sp.add_argument("--all", action="store_true", help="include closed")
+    add("blocked", cmd_blocked, "open work waiting on blockers").add_argument("--mine", action="store_true")
+    sp = add("find", cmd_find, "search titles and descriptions")
+    sp.add_argument("words", nargs="+")
+    sp.add_argument("--all", action="store_true", help="include closed")
+    add("show", cmd_show, "show one bead").add_argument("ref")
+    add("where", cmd_where, "print the planning workspace directory")
+    add("ticket", cmd_ticket, "full Jira issue with comments").add_argument("key")
+    sp = add("pull", cmd_pull, "pull from Jira (all scopes, or the given issues)")
+    sp.add_argument("keys", nargs="*", help="pull just these issues")
+    sp.add_argument("--full", action="store_true")
+    sp.add_argument("--dry-run", action="store_true")
+    sp = add("push", cmd_push, "preview (and with --yes, push) named issues")
+    sp.add_argument("refs", nargs="*")
+    sp.add_argument("--yes", action="store_true", help="actually push after the preview")
+
+    args = p.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()

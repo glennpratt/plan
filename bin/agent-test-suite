@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# agent-test-suite: run scenarios in parallel, each in its own sandbox
+# (agent-test), then list what each one changed.
+#
+#   plan-agent-test-suite [path/to/NN-name.prompt ...]
+#
+# Default: every <workspace>/agent-tests/*.prompt (workspace: `plan where`).
+# A scenario file is "# expect: ..." comment lines (what a good run does,
+# for review) followed by the prompt. Model: $AGENT_TEST_MODEL.
+set -euo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+# Installed as plan-agent-test{,-suite}; in a checkout, agent-test{,-suite}.
+runner="$here/$(basename "$0" | sed 's/-suite$//')"
+base="${AGENT_TEST_DIR:-${TMPDIR:-/tmp}/planning-agent-test}"
+if [ $# -eq 0 ]; then
+	set -- "$("$here/plan" where)"/agent-tests/*.prompt
+fi
+
+mkdir -p "$base"
+for f in "$@"; do
+	name="$(basename "$f" .prompt)"
+	prompt="$(grep -v '^#' "$f")"
+	AGENT_TEST_DIR="$base/$name" "$runner" "$name" "$prompt" >"$base/$name.out" 2>&1 &
+done
+wait
+
+for f in "$@"; do
+	name="$(basename "$f" .prompt)"
+	results="$base/$name/results"
+	echo "== $name"
+	grep '^#' "$f" | sed 's/^# \{0,1\}/   /'
+	echo "   changed: $(wc -l <"$results/$name.changes" 2>/dev/null || echo '? (run failed)') beads"
+	grep -h -E '^copilot exited|exceeded your .*quota' "$results/$name.log" 2>/dev/null | sed 's/^/   FAILED: /' || true
+	echo "   session: $results/$name.md"
+done

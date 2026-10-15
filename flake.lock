@@ -1,0 +1,50 @@
+{
+  "nodes": {
+    "beads": {
+      "inputs": {
+        "nixpkgs": "nixpkgs"
+      },
+      "locked": {
+        "lastModified": 1791322816,
+        "narHash": "sha256-m/hBplOxrarHm1ob7NAakfpwbNIu1BhCSI+3vlGHTMc=",
+        "owner": "glennpratt",
+        "repo": "beads",
+        "rev": "d3622def6c294e22dab12979dfb089afb23794dc",
+        "type": "github"
+      },
+      "original": {
+        "owner": "glennpratt",
+        "ref": "jira-mtls",
+        "repo": "beads",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1782847189,
+        "narHash": "sha256-twXPFqFsrrY5r28Zh7Homgcp2gUMBgQ6WDS98Q/3xFI=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "b6018f87da91d19d0ab4cf979885689b469cdd41",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-25.11",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "beads": "beads",
+        "nixpkgs": [
+          "beads",
+          "nixpkgs"
+        ]
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
