@@ -86,6 +86,24 @@ the ID before `bd comment`.
   the same field, Jira wins with a warning.
 - Ticket descriptions don't list blockers; Jira links are the record.
 
+## Several machines
+
+The workspace can be shared between machines through its Dolt remote
+(`refs/dolt/data` on its git remote).
+
+- Jira commands sync it: `plan pull` and `plan push` pull the Dolt remote
+  first, and a real push publishes it afterwards. For local-only changes
+  (notes, labels, local beads), `bd dolt push` before leaving a machine and
+  `bd dolt pull` on arriving.
+- If a push says its Dolt pull brought in changes to the issues being
+  pushed, preview again (`plan push KEY`) and show the user the new preview.
+- The same field edited on two machines between syncs: the later edit wins
+  silently (`Notice: ... last-write-wins`). Mention such notices to the user.
+- Two machines adding a child under the same parent between syncs get the
+  same ID (`.1`, `.2`, ...), and `bd dolt pull` stops with a conflict.
+  `bd dolt pull --strategy theirs` keeps the other machine's child; then
+  re-create this machine's child (it gets the next number).
+
 ## Work streams and gates
 
 - A **work stream** is a local epic plus a `me:stream:<name>` label on its

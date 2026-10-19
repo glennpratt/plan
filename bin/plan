@@ -37,8 +37,12 @@ import sys
 import tempfile
 import urllib.request
 import ssl
-import tomllib
 from datetime import datetime, timezone
+
+try:
+    import tomllib
+except ImportError:  # Python < 3.11
+    sys.exit(f"plan: needs Python 3.11 or newer (this is {sys.version.split()[0]} at {sys.executable})")
 
 # Board columns in working order: active work first, then waiting, then new.
 COLUMN_ORDER = ["In Progress", "Code Review", "Testing", "Blocked", "To Do", "Escalated", "Triage", "Backlog", "Done"]
@@ -449,9 +453,29 @@ def cmd_pull(args):
     sys.exit(r.returncode)
 
 
+def dolt_pull_first():
+    """Pull the workspace's Dolt remote, if it has one, before previewing a
+    push, so the preview includes other machines' changes. (A dry run can't
+    pull; bd pulls again before the real push and refuses if that changed
+    the issues being pushed.)"""
+    setting = os.environ.get("JIRA_DOLT_SYNC")
+    if setting is None:
+        out = bd("config", "get", "jira.dolt_sync", check=False).stdout.strip()  # "key = value" or "key (not set)"
+        setting = out.split("=", 1)[1] if "=" in out else ("" if "(not set)" in out else out)
+    if setting.strip().lower() in ("false", "0", "off"):
+        return
+    remotes = bd("dolt", "remote", "list", check=False).stdout
+    if not remotes.strip() or "No remotes" in remotes:
+        return
+    r = bd("dolt", "pull", check=False)
+    if r.returncode != 0:
+        die(f"Dolt pull failed; resolve it before pushing (bd dolt pull, --strategy ours|theirs):\n{(r.stdout + r.stderr).strip()}")
+
+
 def cmd_push(args):
     if not args.refs:
         die("push needs explicit issue keys or bead IDs (a full push is never run from here)")
+    dolt_pull_first()
     beads, by_id = load()
     ids = [resolve(by_id, beads, ref)["id"] for ref in args.refs]
     env = jira_env()

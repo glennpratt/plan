@@ -78,6 +78,21 @@ beads configuration: `bd config set jira.…` in the workspace.
 Put the user's own context in the workspace's `AGENTS.md`: projects,
 boards, work streams, team quirks. The skills tell agents to read it.
 
+## Several machines
+
+Give the workspace a git remote and `bd dolt push --yes` once: beads stores
+the database under `refs/dolt/data` there, apart from your branches. On
+another machine, clone it and run `bd bootstrap --yes`.
+
+The beads fork's Jira commands then keep machines in step: `bd jira pull`
+and `bd jira push` pull the Dolt remote first, and a real push pushes it
+afterwards (`jira.dolt_sync=false` turns this off). `plan push` pulls
+before previewing; a real push refuses if its own pull changed the issues
+being pushed, so what is sent always matches a preview. Merges are per
+field; the same field edited on two machines resolves last-write-wins, and
+children created under the same parent on two machines collide (resolve
+with `bd dolt pull --strategy theirs`, then re-create).
+
 ## Develop
 
 ```bash
