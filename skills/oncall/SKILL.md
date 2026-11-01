@@ -5,7 +5,7 @@ description: Help the user clear their on-call escalation board using their pers
 
 # On-call board
 
-Follow the `plan` skill's rules (views, local → preview → push). The
+Follow the `planning-work` skill's rules (views, local → preview → push). The
 workspace's `AGENTS.md` (`plan where`) names the on-call board, its project
 and the status to clear.
 

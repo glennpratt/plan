@@ -5,7 +5,7 @@ description: Work through the user's Jira work board using their personal planni
 
 # Work board
 
-Follow the `plan` skill's rules (views, local → preview → push). The
+Follow the `planning-work` skill's rules (views, local → preview → push). The
 workspace's `AGENTS.md` (`plan where`) says which board this is and what its
 columns mean for the user.
 

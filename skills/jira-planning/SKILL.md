@@ -5,7 +5,7 @@ description: Plan and correct Jira work across people and teams with the user's 
 
 # Jira planning
 
-Follow the `plan` skill's rules (views, local → preview → push). The
+Follow the `planning-work` skill's rules (views, local → preview → push). The
 workspace's `AGENTS.md` (`plan where`) lists the user's projects and the
 teams they file requests with.
 

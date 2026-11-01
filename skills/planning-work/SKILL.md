@@ -1,5 +1,5 @@
 ---
-name: plan
+name: planning-work
 description: How to read and change the user's personal Jira planning workspace (a beads database mirroring Jira) with the `plan` and `bd` commands, and the rules that keep Jira safe. Use whenever you look up, plan, track, or update tickets, epics, stories, tasks, blockers or discovered bugs in "planning", or before any other planning skill (work-board, oncall, jira-planning).
 ---
 
