@@ -491,8 +491,10 @@ def cmd_push(args):
         return
     if not lines:
         return
-    r = bd("jira", "push", *ids, env=env, check=False)
-    print((r.stdout + r.stderr).strip())
+    # Not captured: bd's stdout and stderr (Dolt steps, warnings, the result)
+    # appear live and in order; its exit status is non-zero if any issue failed.
+    sys.stdout.flush()
+    r = bd("jira", "push", *ids, env=env, check=False, capture=False)
     sys.exit(r.returncode)
 
 

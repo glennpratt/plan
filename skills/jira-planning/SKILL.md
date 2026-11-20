@@ -25,11 +25,12 @@ work: the input for assigning and rebalancing.
 
 - New stories under an epic: `bd create -t story "..." --parent <epic-id> -l jira`
   (the `jira` label is what makes it go to Jira; children do not inherit it).
-- Work for another team: add `--metadata '{"jira_project":"KEY"}'` (or
-  create it under that team's ticket); the preview reports required fields
-  to supply via `jira_fields` metadata. Model it on that team's existing
-  requests (`plan find`), and make the work that needs it wait on it
-  (`bd dep add <waiting-id> <new-id>`).
+- Work for another team: `bd create ... --metadata '{"jira_project":"KEY"}'`
+  (on an existing bead, `bd update <id> --set-metadata jira_project=KEY`),
+  or create it under that team's ticket; the preview reports required fields and
+  their options (see "Creating issues in Jira" in `planning-work`). Model it
+  on that team's existing requests (`plan find`), and make the work that
+  needs it wait on it (`bd dep add <waiting-id> <new-id>`).
 - Assign: `bd update <id> --assignee <jira-username>`.
 - Re-parent (move to another epic): remove the old parent-child dependency,
   add the new one. Sub-task re-parenting is not supported (needs Jira Move).

@@ -5,11 +5,11 @@
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "lastModified": 1792450592,
-        "narHash": "sha256-t0U5VkJ1FsYVFcF7gXZNhgkFpwLtN3+o3hjk3je1PrE=",
+        "lastModified": 1795214397,
+        "narHash": "sha256-vK1YFhMZGmnGpiyr2Y9LTkqh2kQjZG9BWh3KAcD1FzA=",
         "owner": "glennpratt",
         "repo": "beads",
-        "rev": "4067494d2e79880dd818617ddcafd3043e2220f6",
+        "rev": "8e5bbb202cba79f8b9fa9c64fed24202cd8d070c",
         "type": "github"
       },
       "original": {

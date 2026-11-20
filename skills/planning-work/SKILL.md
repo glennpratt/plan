@@ -80,11 +80,32 @@ the ID before `bd comment`.
 - `board:<name>` / `backlog:<name>` labels mirror Jira boards; don't set
   them by hand.
 - New beads under a Jira epic become stories with an Epic Link; under a
-  story, sub-tasks. `--metadata '{"jira_project":"KEY"}'` files into another
-  project; the preview lists required fields it lacks.
+  story, sub-tasks. `bd create ... --metadata '{"jira_project":"KEY"}'` (or
+  later `bd update <id> --set-metadata jira_project=KEY`) files into another
+  project.
 - Local edits to pulled issues survive pulls until pushed; if Jira changed
   the same field, Jira wins with a warning.
 - Ticket descriptions don't list blockers; Jira links are the record.
+
+## Creating issues in Jira
+
+The preview of a new bead (`plan push ID`) checks the project's create
+screen: it names each required field that is missing and each select value
+that isn't one of its options, and lists the options. Fix those and preview
+again; the push refuses (before calling Jira) while any remain.
+
+- Set create fields with
+  `bd update <id> --set-metadata 'jira_fields={"customfield_14747":"DevQA"}'`.
+  A select takes an option's value, name or ID, in any case. On an
+  existing bead use `--set-metadata`, which keeps the other metadata;
+  `bd update --metadata` replaces all of it. (`bd create --metadata` with
+  `{"jira_fields": {...}}` is fine for a new bead.)
+- Choose an option only when the work makes it clear (for "Detection
+  Environment", where the problem was seen). Otherwise ask the user rather
+  than guess, and offer to record the answer in the workspace's `AGENTS.md`
+  so later creates of that kind don't need to ask.
+- Check the workspace's `AGENTS.md` first: it may already say which values
+  to use for a project's required fields.
 
 ## Several machines
 
