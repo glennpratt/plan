@@ -75,6 +75,26 @@ oncall_project = "OPS"       # for plan oncall --recent
 The Jira sync itself (projects, scopes, boards, field and status maps) is
 beads configuration: `bd config set jira.…` in the workspace.
 
+### Faster with `bd serve` (optional)
+
+Each `bd` call starts a large binary and opens the database, about a
+second per `plan` view, more where endpoint security scans every launch. A
+workspace in Dolt server mode can run `bd serve` (bd 1.4 or newer) under a
+user service; with its address in the per-device dotfile, views and local
+changes use its loopback HTTP API instead (about 0.2–0.3 s):
+
+```toml
+# ~/.config/plan/config.toml
+[serve]
+url = "http://127.0.0.1:3400"
+token_file = "~/.config/plan/serve-token"   # only if bd serve has --auth-token-file
+```
+
+`plan where -v` says which is used. `plan` falls back to `bd` when the server
+is down or serves a different workspace (a sandbox copy, for example), and
+`PLAN_SERVE_URL=off` forces `bd`. Jira commands (`pull`, `push`) always run
+`bd`.
+
 Put the user's own context in the workspace's `AGENTS.md`: projects,
 boards, work streams, team quirks. The skills tell agents to read it.
 

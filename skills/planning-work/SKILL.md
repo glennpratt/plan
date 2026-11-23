@@ -36,10 +36,20 @@ either, `bd` needs the bead ID. `plan --help` lists everything. Don't use
 
 ## Writing: local first, then preview, then push named issues
 
-1. Change beads locally: `bd update <id> --status in_progress`,
-   `--assignee <user>`, `--title ...`, `bd close <id> -r "reason"`,
-   `bd comment <id> "text"`, `bd dep add <a> <b>` (a waits on b),
-   `bd create ... --parent <epic> -l jira`.
+1. Change beads locally. These take a Jira key or bead ID and say what
+   to push next:
+
+   | Command | Change |
+   |---|---|
+   | `plan start KEY` | status in_progress |
+   | `plan assign KEY USER` | assignee (`-` for none) |
+   | `plan comment KEY TEXT` | comment (shared once pushed) |
+   | `plan note KEY TEXT` | private note (never pushed) |
+   | `plan close KEY -r REASON` | close; the reason becomes a Jira comment |
+   | `plan label KEY LABEL... [--remove LABEL]` | labels |
+
+   For anything else use `bd` with the bead ID: `bd update <id> --title ...`,
+   `bd dep add <a> <b>` (a waits on b), `bd create ... --parent <epic> -l jira`.
 2. Preview: `plan push <KEY|ID>...` (no `--yes`). Show the preview to the user.
 3. Only after the user approves that exact preview:
    `plan push <KEY|ID>... --yes`.

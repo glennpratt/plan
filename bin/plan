@@ -10,7 +10,16 @@ Read-only views work from any directory and need no Jira credentials:
   plan blocked [--mine]        open work waiting on open blockers (cross-team first)
   plan find WORDS...           search titles and descriptions
   plan show KEY|ID             one bead (bd show)
-  plan where                   the planning workspace directory
+  plan where [-v]              the planning workspace directory
+
+Local changes (Jira keys or bead IDs; preview and push them with plan push):
+
+  plan start KEY|ID            status in_progress
+  plan assign KEY|ID USER      assignee (- for none)
+  plan comment KEY|ID TEXT...  comment, shared with Jira when pushed
+  plan note KEY|ID TEXT...     private note, never sent to Jira
+  plan close KEY|ID -r REASON  close; the reason becomes a Jira comment
+  plan label KEY|ID LABEL... [--remove LABEL]
 
 Jira (token from $JIRA_API_TOKEN, else the 1Password reference in plan.toml):
 
@@ -24,6 +33,8 @@ Add --json to a view for machine-readable output.
 Configuration: ~/.config/plan/config.toml names the workspace (data =
 "~/path/to/planning"); $PLAN_DATA overrides it. The workspace's plan.toml
 holds the Jira settings; the per-device config.toml may override any of them.
+With [serve] url = "http://127.0.0.1:PORT" (a running `bd serve` for this
+workspace), views and local changes use its HTTP API instead of starting bd.
 """
 
 import argparse
@@ -35,6 +46,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.parse
 import urllib.request
 import ssl
 from datetime import datetime, timezone
@@ -106,11 +119,96 @@ def bd(*args, env=None, check=True, capture=True):
     return r
 
 
+# ---------------------------------------------------------------- bd serve
+#
+# When the workspace runs `bd serve` (server mode), reads and plan's own
+# writes go over its loopback HTTP API instead of starting bd: no process
+# launch and no database open per command. Configured per device:
+#
+#   [serve]
+#   url = "http://127.0.0.1:3400"
+#   token_file = "~/.config/plan/serve-token"   # only if bd serve has --auth-token-file
+#
+# $PLAN_SERVE_URL overrides the URL; PLAN_SERVE_URL=off forces bd. A server
+# that is down, or that serves a different workspace (as in a sandbox copy
+# with $PLAN_DATA), is not used: plan falls back to bd.
+
+SERVE = CFG.get("serve", {})
+_serve_state = {}
+
+
+def serve_url():
+    """The bd serve base URL for this workspace, or None to use bd."""
+    if "url" in _serve_state:
+        return _serve_state["url"]
+    url = os.environ.get("PLAN_SERVE_URL", SERVE.get("url", "")).rstrip("/")
+    _serve_state["url"] = None
+    _serve_state["why"] = "not configured"
+    if not url or url.lower() == "off":
+        _serve_state["why"] = "turned off" if url else "not configured"
+        return None
+    try:
+        ctx = _http("GET", f"{url}/v0/beads/context", timeout=2)
+    except Exception as e:  # down, refused, sandboxed: use bd
+        _serve_state["why"] = f"{url} not reachable ({e.__class__.__name__})"
+        return None
+    served = os.path.realpath(ctx.get("beads_dir") or "")
+    if served != os.path.realpath(os.path.join(PLANNING, ".beads")):
+        _serve_state["why"] = f"{url} serves {served}, not this workspace"
+        return None
+    _serve_state["url"] = url
+    return url
+
+
+def _http(method, url, body=None, timeout=60):
+    headers = {"Accept": "application/json"}
+    if SERVE.get("token_file"):
+        with open(os.path.expanduser(SERVE["token_file"])) as f:
+            headers["Authorization"] = "Bearer " + f.readline().strip()
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        try:
+            problem = json.loads(e.read())
+            detail = problem.get("detail") or problem.get("title") or ""
+        except ValueError:
+            detail = ""
+        raise ApiError(e.code, detail) from None
+    return json.loads(raw) if raw else {}
+
+
+class ApiError(Exception):
+    def __init__(self, status, detail):
+        super().__init__(f"{status} {detail}")
+        self.status, self.detail = status, detail
+
+
+def api(method, path, body=None, **query):
+    """Call bd serve; dies with the server's explanation on an error."""
+    url = serve_url() + "/v0/beads/" + path
+    params = [(k, v) for k, v in query.items() if v is not None]
+    if params:
+        url += "?" + urllib.parse.urlencode(params, doseq=True)
+    try:
+        return _http(method, url, body)
+    except ApiError as e:
+        die(f"{method} {path}: {e.detail or e.status}")
+
+
 def load():
-    """All beads, with derived fields, from one export."""
-    with tempfile.NamedTemporaryFile(suffix=".jsonl") as f:
-        bd("export", "-o", f.name)
-        beads = [json.loads(l) for l in open(f.name) if l.strip()]
+    """All beads, with derived fields: one list from bd serve, else one bd export."""
+    if serve_url():
+        beads = api("GET", "issues", all="true", include_gates="true", include_templates="true", limit=0)["items"]
+    else:
+        with tempfile.NamedTemporaryFile(suffix=".jsonl") as f:
+            bd("export", "-o", f.name)
+            beads = [json.loads(l) for l in open(f.name) if l.strip()]
     by_id = {b["id"]: b for b in beads}
     for b in beads:
         ref = b.get("external_ref") or ""
@@ -185,6 +283,36 @@ def resolve(by_id, beads, ref):
         if b["key"].upper() == ref.upper():
             return b
     die(f"no bead for {ref}")
+
+
+JIRA_KEY = re.compile(r"^[A-Za-z][A-Za-z0-9_]*-\d+$")
+
+
+def key_of(b):
+    ref = b.get("external_ref") or ""
+    return ref.rsplit("/", 1)[-1] if "/browse/" in ref else ""
+
+
+def find(ref):
+    """(bead ID, Jira key or "") for a Jira key or bead ID. With bd serve, one
+    or two small requests; otherwise from the full load."""
+    if not serve_url():
+        beads, by_id = load()
+        b = resolve(by_id, beads, ref)
+        return b["id"], b["key"]
+    if JIRA_KEY.match(ref):
+        items = api("GET", "issues", all="true", include_gates="true", brief="true",
+                    external_contains=f"/browse/{ref.upper()}", limit=20)["items"]
+        for b in items:
+            if key_of(b).upper() == ref.upper():
+                return b["id"], key_of(b)
+    try:
+        b = _http("GET", f"{serve_url()}/v0/beads/issues/{urllib.parse.quote(ref)}")
+    except ApiError as e:
+        if e.status == 404:
+            die(f"no bead for {ref}")
+        die(f"GET issues/{ref}: {e.detail or e.status}")
+    return b["id"], key_of(b)
 
 
 def row(b, board=None, extra=""):
@@ -359,22 +487,142 @@ def cmd_find(args):
 
 
 def cmd_show(args):
-    beads, by_id = load()
-    b = resolve(by_id, beads, args.ref)
-    r = bd("show", b["id"])
-    print(r.stdout)
-    if b["key"] and JIRA_BROWSE:
-        print(JIRA_BROWSE + b["key"])
+    if not serve_url():
+        bid, key = find(args.ref) if JIRA_KEY.match(args.ref) else (args.ref, "")
+        r = bd("show", bid, *(["--json"] if args.json else []))
+        print(r.stdout)
+        if key and JIRA_BROWSE and not args.json:
+            print(JIRA_BROWSE + key)
+        return
+    b = api("GET", f"issues/{urllib.parse.quote(find(args.ref)[0])}", include_comments="true", include_dependents="true")
+    if args.json:
+        print(json.dumps(b, indent=1))
+        return
+    meta = b.get("metadata") if isinstance(b.get("metadata"), dict) else {}
+    key = key_of(b)
+
+    def both(local, jira):
+        return f"{local} (Jira: {jira})" if jira and str(jira).lower() != str(local).lower() else str(local)
+
+    def ref_line(x):
+        k = key_of(x)
+        return f"{k + ' ' if k else ''}{x['id']} [{x.get('status')}] {x.get('title', '')}"
+
+    print(f"{key or '(local)'}  {b['id']}  {b.get('title', '')}")
+    if key and JIRA_BROWSE:
+        print(JIRA_BROWSE + key)
+    print(f"Status: {both(b.get('status'), meta.get('jira_status'))}  Priority: {both('P' + str(b.get('priority')), meta.get('jira_priority'))}  "
+          f"Type: {both(b.get('issue_type'), meta.get('jira_type'))}  Assignee: {b.get('assignee') or '-'}")
+    if b.get("close_reason"):
+        print(f"Closed {(b.get('closed_at') or '')[:10]}: {b['close_reason']}")
+    if b.get("labels"):
+        print("Labels: " + ", ".join(sorted(b["labels"])))
+    groups = {}
+    for d in b.get("dependencies") or []:
+        groups.setdefault({"parent-child": "Parent", "blocks": "Waits on"}.get(d.get("dependency_type"), d.get("dependency_type")), []).append(d)
+    for d in b.get("dependents") or []:
+        groups.setdefault({"parent-child": "Children", "blocks": "Blocks"}.get(d.get("dependency_type"), f"{d.get('dependency_type')} (from)"), []).append(d)
+    for name, ds in groups.items():
+        print(f"{name}:")
+        for d in ds:
+            print(f"  {ref_line(d)}")
+    if b.get("description"):
+        print("\nDescription:\n" + b["description"].rstrip())
+    if b.get("notes"):
+        print("\nNotes (private, never sent to Jira):\n" + b["notes"].rstrip())
+    comments = b.get("comments") or []
+    if comments:
+        print(f"\nComments ({len(comments)}, local; Jira's live comments: plan ticket {key or 'KEY'}):")
+        for c in comments:
+            print(f"[{(c.get('created_at') or '')[:16].replace('T', ' ')}] {c.get('author')}: {c.get('text', '').rstrip()}")
 
 
 def cmd_where(args):
+    url = serve_url()
     if args.json:
         # For sandboxes (plan-agent-test): what to copy and what to deny.
         creds = sorted({os.path.dirname(os.path.expanduser(JIRA[k]))
                         for k in ("client_cert", "client_key", "ca_cert") if JIRA.get(k)})
-        print(json.dumps({"data": PLANNING, "credential_dirs": creds}))
+        print(json.dumps({"data": PLANNING, "credential_dirs": creds, "serve": url}))
         return
     print(PLANNING)
+    if args.verbose:
+        print(f"reads and writes: {'bd serve at ' + url if url else 'bd (' + _serve_state['why'] + ')'}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------- local changes
+#
+# Each changes the local bead only and says how to send it to Jira. Jira keys
+# or bead IDs; bd serve when it is up, else the bd command shown in --help.
+
+def changed(bid, key, what, jira=True):
+    tail = f" To send it to Jira: plan push {key} (preview first)." if key and jira else ""
+    print(f"{key + ' ' if key else ''}{bid}: {what}, locally.{tail}")
+
+
+def cmd_start(args):
+    bid, key = find(args.ref)
+    if serve_url():
+        api("PATCH", f"issues/{bid}", {"actor": ME, "patch": {"status": "in_progress"}})
+    else:
+        bd("update", bid, "--status", "in_progress")
+    changed(bid, key, "status in_progress")
+
+
+def cmd_assign(args):
+    bid, key = find(args.ref)
+    who = "" if args.user in ("-", "none") else args.user
+    if serve_url():
+        api("PATCH", f"issues/{bid}", {"actor": ME, "patch": {"assignee": who}, "force_assignee_transfer": True})
+    else:
+        bd("update", bid, "--assignee", who)
+    changed(bid, key, f"assignee {who or '(none)'}")
+
+
+def cmd_comment(args):
+    bid, key = find(args.ref)
+    text = " ".join(args.text)
+    if serve_url():
+        api("POST", f"issues/{bid}/comments", {"author": ME, "text": text})
+    else:
+        bd("comment", bid, text)
+    changed(bid, key, "comment added (shared once pushed)")
+
+
+def cmd_note(args):
+    bid, key = find(args.ref)
+    text = " ".join(args.text)
+    if serve_url():
+        cur = api("GET", f"issues/{bid}").get("notes") or ""
+        api("PATCH", f"issues/{bid}", {"actor": ME, "patch": {"append_notes": ("\n" if cur else "") + text}})
+    else:
+        bd("note", bid, text)
+    print(f"{key + ' ' if key else ''}{bid}: note added (private; never sent to Jira).")
+
+
+def cmd_close(args):
+    bid, key = find(args.ref)
+    if serve_url():
+        api("POST", f"issues/{bid}:close", {"actor": ME, "reason": args.reason})
+    else:
+        bd("close", bid, "-r", args.reason)
+    changed(bid, key, "closed (the reason becomes a Jira comment when pushed)")
+
+
+def cmd_label(args):
+    bid, key = find(args.ref)
+    add, remove = args.labels, args.remove or []
+    if serve_url():
+        patch = {k: v for k, v in (("add_labels", add), ("remove_labels", remove)) if v}
+        api("PATCH", f"issues/{bid}", {"actor": ME, "patch": patch})
+    else:
+        for l in add:
+            bd("label", "add", bid, l)
+        for l in remove:
+            bd("label", "remove", bid, l)
+    personal = all(l.startswith("me:") for l in add + remove)
+    changed(bid, key, "labels " + " ".join([f"+{l}" for l in add] + [f"-{l}" for l in remove])
+            + (" (me:* labels never go to Jira)" if personal else ""), jira=not personal)
 
 
 # ---------------------------------------------------------------- Jira
@@ -523,7 +771,25 @@ def main():
     sp.add_argument("words", nargs="+")
     sp.add_argument("--all", action="store_true", help="include closed")
     add("show", cmd_show, "show one bead").add_argument("ref")
-    add("where", cmd_where, "print the planning workspace directory")
+    add("where", cmd_where, "print the planning workspace directory").add_argument(
+        "-v", "--verbose", action="store_true", help="also say whether bd serve is used")
+    add("start", cmd_start, "set status in_progress (local)").add_argument("ref")
+    sp = add("assign", cmd_assign, "set the assignee (local); - for none")
+    sp.add_argument("ref")
+    sp.add_argument("user")
+    sp = add("comment", cmd_comment, "add a comment (local; shared with Jira when pushed)")
+    sp.add_argument("ref")
+    sp.add_argument("text", nargs="+")
+    sp = add("note", cmd_note, "append a private note (never sent to Jira)")
+    sp.add_argument("ref")
+    sp.add_argument("text", nargs="+")
+    sp = add("close", cmd_close, "close (local); the reason becomes a Jira comment when pushed")
+    sp.add_argument("ref")
+    sp.add_argument("-r", "--reason", required=True)
+    sp = add("label", cmd_label, "add labels (and --remove labels) (local)")
+    sp.add_argument("ref")
+    sp.add_argument("labels", nargs="*")
+    sp.add_argument("--remove", action="append", metavar="LABEL")
     add("ticket", cmd_ticket, "full Jira issue with comments").add_argument("key")
     sp = add("pull", cmd_pull, "pull from Jira (all scopes, or the given issues)")
     sp.add_argument("keys", nargs="*", help="pull just these issues")
