@@ -79,9 +79,9 @@ beads configuration: `bd config set jira.…` in the workspace.
 
 Each `bd` call starts a large binary and opens the database, about a
 second per `plan` view, more where endpoint security scans every launch. A
-workspace in Dolt server mode can run `bd serve` (bd 1.4 or newer) under a
-user service; with its address in the per-device dotfile, views and local
-changes use its loopback HTTP API instead (about 0.2–0.3 s):
+workspace in Dolt server mode can run `bd serve` (a beads build with the
+HTTP API) under a user service; with its address in the per-device dotfile,
+views and local changes use its loopback HTTP API instead (about 0.2–0.3 s):
 
 ```toml
 # ~/.config/plan/config.toml
@@ -94,6 +94,38 @@ token_file = "~/.config/plan/serve-token"   # only if bd serve has --auth-token-
 is down or serves a different workspace (a sandbox copy, for example), and
 `PLAN_SERVE_URL=off` forces `bd`. Jira commands (`pull`, `push`) always run
 `bd`.
+
+Server mode keeps the database in `.beads/dolt/` and runs `dolt sql-server`
+(2.6.0 or newer, included in the package), which `bd` starts on demand. Pin
+its port (`bd dolt set port 3399`, recorded in `metadata.json`): `bd serve`
+reaches Dolt through a proxy that records the port, and refuses to start
+after the server comes back on a different one.
+
+`plan serve` runs `bd serve` at the configured address in the foreground,
+for a service manager to keep running. It exits 0 without starting anything
+when there is no `[serve] url` or the workspace is still embedded, so the
+service can be installed before the switch (restart it afterwards). launchd
+(`~/Library/LaunchAgents/<label>.plist`):
+
+```xml
+<key>ProgramArguments</key>
+<array><string>/Users/me/.nix-profile/bin/plan</string><string>serve</string></array>
+<key>RunAtLoad</key><true/>
+<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+```
+
+systemd (`~/.config/systemd/user/plan-serve.service`):
+
+```ini
+[Service]
+ExecStart=%h/.nix-profile/bin/plan serve
+Restart=on-failure
+```
+
+Recent beads only send the Jira token to a Jira URL from a private source
+(the environment or `~/.config/bd/config.yaml`), not the workspace's shared
+config; `plan pull` and `plan push` pass `plan.toml`'s `jira.api` as
+`JIRA_URL`.
 
 Put the user's own context in the workspace's `AGENTS.md`: projects,
 boards, work streams, team quirks. The skills tell agents to read it.

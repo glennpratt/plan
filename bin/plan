@@ -35,6 +35,7 @@ Configuration: ~/.config/plan/config.toml names the workspace (data =
 holds the Jira settings; the per-device config.toml may override any of them.
 With [serve] url = "http://127.0.0.1:PORT" (a running `bd serve` for this
 workspace), views and local changes use its HTTP API instead of starting bd.
+`plan serve` runs that server in the foreground, for a user service.
 """
 
 import argparse
@@ -550,6 +551,49 @@ def cmd_where(args):
         print(f"reads and writes: {'bd serve at ' + url if url else 'bd (' + _serve_state['why'] + ')'}", file=sys.stderr)
 
 
+def cmd_serve(args):
+    """Run `bd serve` for this workspace at [serve] url, in the foreground, for
+    a user service (launchd, systemd). Exits 0 without starting anything when
+    there is no [serve] url or the workspace is not in server mode, so a
+    service installed ahead of the switch stays quiet."""
+    url = os.environ.get("PLAN_SERVE_URL", SERVE.get("url", ""))
+    if not url or url.lower() == "off":
+        print("plan serve: no [serve] url configured; nothing to serve.", file=sys.stderr)
+        return
+    u = urllib.parse.urlsplit(url)
+    host = {"localhost": "127.0.0.1"}.get(u.hostname, u.hostname)
+    if u.scheme != "http" or not host or not u.port:
+        die(f"plan serve: [serve] url must look like http://127.0.0.1:PORT, not {url}")
+    beads = os.path.join(PLANNING, ".beads")
+    try:
+        with open(os.path.join(beads, "metadata.json")) as f:
+            meta = json.load(f)
+    except (OSError, ValueError) as e:
+        die(f"plan serve: cannot read {beads}/metadata.json: {e}")
+    if meta.get("dolt_mode") != "server":
+        print(f"plan serve: {PLANNING} is in {meta.get('dolt_mode', 'embedded')} mode and bd serve needs "
+              "server mode; nothing to serve.", file=sys.stderr)
+        return
+    # bd serve reaches Dolt through a proxy that records the server's port. A
+    # bd-managed server on an ephemeral port gets a new one when it restarts,
+    # and bd serve then refuses to start against the stale proxy.
+    try:
+        with open(os.path.join(beads, "config.yaml")) as f:
+            yaml_port = re.search(r"^dolt:[ \t]*\n(?:[ \t]+.*\n)*?[ \t]+port:[ \t]*\d+", f.read(), re.M)
+    except OSError:
+        yaml_port = None
+    if not (meta.get("dolt_server_port") or yaml_port or os.environ.get("BEADS_DOLT_SERVER_PORT")):
+        print("plan serve: warning: the Dolt server's port is not pinned (bd dolt set port N); "
+              "bd serve may fail to start after the Dolt server restarts.", file=sys.stderr)
+    exe = shutil.which("bd") or die("bd not found on PATH")
+    cmd = ["bd", "serve", "--addr", f"{host}:{u.port}"]
+    if SERVE.get("token_file"):
+        cmd += ["--auth-token-file", os.path.expanduser(SERVE["token_file"])]
+    print(f"plan serve: {' '.join(cmd)} in {PLANNING}", file=sys.stderr, flush=True)
+    os.chdir(PLANNING)
+    os.execve(exe, cmd, {**os.environ, "BD_NON_INTERACTIVE": "1", "BEADS_ACTOR": ME})
+
+
 # ---------------------------------------------------------------- local changes
 #
 # Each changes the local bead only and says how to send it to Jira. Jira keys
@@ -648,6 +692,12 @@ def jira_env():
             die(f"{handoff}\n(1Password: {r.stderr.strip()})")
         token = r.stdout.strip()
     env = {"JIRA_API_TOKEN": token}
+    # bd sends the token only to a Jira URL from a private source (its own
+    # user config or the environment), not one from the workspace's shared
+    # database config. plan.toml's api is where `plan ticket` already sends
+    # the token, so it vouches for the same endpoint.
+    if JIRA.get("api") and not os.environ.get("JIRA_URL"):
+        env["JIRA_URL"] = JIRA["api"]
     for var, key in (("JIRA_CLIENT_CERT", "client_cert"), ("JIRA_CLIENT_KEY", "client_key"), ("JIRA_CA_CERT", "ca_cert")):
         if JIRA.get(key):
             env[var] = os.path.expanduser(JIRA[key])
@@ -773,6 +823,7 @@ def main():
     add("show", cmd_show, "show one bead").add_argument("ref")
     add("where", cmd_where, "print the planning workspace directory").add_argument(
         "-v", "--verbose", action="store_true", help="also say whether bd serve is used")
+    add("serve", cmd_serve, "run bd serve for this workspace (for a user service)")
     add("start", cmd_start, "set status in_progress (local)").add_argument("ref")
     sp = add("assign", cmd_assign, "set the assignee (local); - for none")
     sp.add_argument("ref")
