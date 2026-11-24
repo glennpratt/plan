@@ -3,7 +3,7 @@
 
   inputs = {
     # The beads fork with Jira Server/DC support (mTLS, hierarchy, safe push).
-    beads.url = "github:glennpratt/beads/jira-mtls";
+    beads.url = "github:glennpratt/beads/jira-mtls-rebase";
     nixpkgs.follows = "beads/nixpkgs";
   };
 

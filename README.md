@@ -5,7 +5,7 @@ Views and safe Jira sync for a personal planning workspace: a
 issues one person cares about (their board, an on-call board, linked issues
 from other teams) plus local-only work Jira doesn't track.
 
-It is built on a [beads fork](https://github.com/glennpratt/beads/tree/jira-mtls)
+It is built on a [beads fork](https://github.com/glennpratt/beads/tree/jira-mtls-rebase)
 with Jira Server/Data Center support: mTLS, epic/parent hierarchy, boards and
 scopes, links, comments, and a push that only sends what changed.
 
