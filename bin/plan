@@ -574,6 +574,14 @@ def cmd_serve(args):
         print(f"plan serve: {PLANNING} is in {meta.get('dolt_mode', 'embedded')} mode and bd serve needs "
               "server mode; nothing to serve.", file=sys.stderr)
         return
+    # A clone switched to server mode before `bd bootstrap` has no database
+    # yet. Fail temporarily (EX_TEMPFAIL) so the service manager retries and
+    # the server comes up on its own once bootstrap has cloned it.
+    db = meta.get("dolt_database") or "beads"
+    if not os.path.isdir(os.path.join(beads, "dolt", db, ".dolt")):
+        print(f"plan serve: no database {db} in {beads}/dolt yet (bd bootstrap --yes); will retry.",
+              file=sys.stderr)
+        sys.exit(75)
     # bd serve reaches Dolt through a proxy that records the server's port. A
     # bd-managed server on an ephemeral port gets a new one when it restarts,
     # and bd serve then refuses to start against the stale proxy.

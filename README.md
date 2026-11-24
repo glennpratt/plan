@@ -117,7 +117,9 @@ update `bd`, and run `bd bootstrap --yes`.
 `plan serve` runs `bd serve` at the configured address in the foreground,
 for a service manager to keep running. It exits 0 without starting anything
 when there is no `[serve] url` or the workspace is still embedded, so the
-service can be installed before the switch (restart it afterwards). launchd
+service can be installed before the switch (restart it afterwards). In server
+mode before `bd bootstrap` it exits 75, so a service that restarts on
+failure comes up by itself once the database is cloned. launchd
 (`~/Library/LaunchAgents/<label>.plist`):
 
 ```xml
