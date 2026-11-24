@@ -583,7 +583,7 @@ def cmd_serve(args):
     except OSError:
         yaml_port = None
     if not (meta.get("dolt_server_port") or yaml_port or os.environ.get("BEADS_DOLT_SERVER_PORT")):
-        print("plan serve: warning: the Dolt server's port is not pinned (bd dolt set port N); "
+        print("plan serve: warning: the Dolt server's port is not pinned (dolt: port: N in .beads/config.yaml); "
               "bd serve may fail to start after the Dolt server restarts.", file=sys.stderr)
     exe = shutil.which("bd") or die("bd not found on PATH")
     cmd = ["bd", "serve", "--addr", f"{host}:{u.port}"]

@@ -97,9 +97,22 @@ is down or serves a different workspace (a sandbox copy, for example), and
 
 Server mode keeps the database in `.beads/dolt/` and runs `dolt sql-server`
 (2.6.0 or newer, included in the package), which `bd` starts on demand. Pin
-its port (`bd dolt set port 3399`, recorded in `metadata.json`): `bd serve`
-reaches Dolt through a proxy that records the port, and refuses to start
-after the server comes back on a different one.
+its port in `.beads/config.yaml`: `bd serve` reaches Dolt through a proxy
+that records the port, and refuses to start after the server comes back on
+a different one.
+
+```yaml
+dolt:
+  port: 3399
+```
+
+(Not `bd dolt set port`: it records the port in `metadata.json`, which
+declares the server externally managed, and `bd` then never starts it.)
+To switch a workspace, back up `.beads`, `bd migrate schema --force` on one
+machine, move `.beads/embeddeddolt` to `.beads/dolt`, set `"dolt_mode":
+"server"` in `metadata.json`, pin the port, `bd dolt push`, and commit
+both files. Other machines move their `.beads/embeddeddolt` aside, pull,
+update `bd`, and run `bd bootstrap --yes`.
 
 `plan serve` runs `bd serve` at the configured address in the foreground,
 for a service manager to keep running. It exits 0 without starting anything
